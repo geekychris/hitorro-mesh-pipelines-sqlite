@@ -28,10 +28,13 @@ nodes:
           JOIN addresses s ON s.ROWID = m.sender
           WHERE s.address IS NOT NULL
       steps:
-        - {kind: groovy-map, script: |
+        # Block style (- kind:) — required because YAML block-literals
+        # (`|`) can't appear inside flow style `- {kind: …, script: |}`.
+        - kind: groovy-map
+          script: |
             def at = row.sender?.indexOf('@')
             if (at != null && at > 0) row.domain = row.sender.substring(at + 1).toLowerCase()
-            row}
+            row
         - {kind: filter, expr: "domain != null"}
       reduce:
         group-by: [domain]
