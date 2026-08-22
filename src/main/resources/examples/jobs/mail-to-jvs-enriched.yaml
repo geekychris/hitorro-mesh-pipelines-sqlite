@@ -1,0 +1,248 @@
+# =========================================================================
+#  mail-to-jvs-enriched
+#
+#  Query mail → shape each row into a JVS email object → enrich (sentence
+#  segment + named-entity extract) → index into a queryable Lucene store.
+#
+#  This is the DEEP pipeline — starts from raw Mail SQLite, produces
+#  fully-enriched JVS documents you can search via a REST endpoint.
+#  Every meaningful line has a comment. Skim the "CHANGE THIS" markers
+#  to see what to tweak for your own data.
+#
+#  Driver-local only (SQLite source can't dispatch to remote agents).
+#  Run via mesh-pipeline.sh run mail-to-jvs-enriched.yaml --wait --events
+#  Or from the UI: Pipelines tab → Run → paste → ▶ Run.
+# =========================================================================
+
+job: mail-to-jvs-enriched
+nodes:
+  # ---------------------------------------------------------------------
+  # NODE: enrich
+  # Reads raw Mail rows via SQLite, reshapes into JVS `email` documents,
+  # runs OpenNLP enrichment (sentence segmentation + POS + NER), indexes
+  # into a type-aware Lucene index.
+  # ---------------------------------------------------------------------
+  - id: enrich
+    pipeline:
+      source:
+        # -----------------------------------------------------------------
+        # SOURCE  —  read from the local Mail SQLite database.
+        # -----------------------------------------------------------------
+        # Adjust the V10 path if your macOS predates Sonoma (V9, V8...).
+        # CHANGE THIS: to run against a different mail account or
+        # database file entirely, just change `path`.
+        kind: sqlite
+        path: "~/Library/Mail/V10/MailData/Envelope Index"
+        # The join stitches messages + addresses + subjects + summaries +
+        # mailboxes so each row has the sender email, subject text,
+        # body preview (up to a few hundred chars — Mac Mail stores
+        # this in the `summaries` table), and mailbox URL.
+        #
+        # CHANGE THIS: swap WHERE / ORDER BY / LIMIT to focus on a
+        # particular sender, date range, or account. The 500-row cap
+        # keeps first-run enrichment under a minute; remove it for a
+        # full-inbox pass (many minutes on a large mailbox).
+        query: |
+          SELECT
+            m.ROWID                                       AS id,
+            m.date_received                               AS received_ts,
+            addr.address                                  AS sender_address,
+            addr.comment                                  AS sender_name,
+            subj.subject                                  AS subject,
+            summ.summary                                  AS body,
+            mb.url                                        AS mailbox_url,
+            m.read                                        AS read,
+            m.flagged                                     AS flagged,
+            m.size                                        AS size_bytes,
+            (SELECT COUNT(*) FROM recipients r WHERE r.message = m.ROWID)
+                                                          AS recipient_count
+          FROM messages m
+          LEFT JOIN addresses addr ON addr.ROWID = m.sender
+          LEFT JOIN subjects  subj ON subj.ROWID = m.subject
+          LEFT JOIN summaries summ ON summ.ROWID = m.summary
+          LEFT JOIN mailboxes mb   ON mb.ROWID   = m.mailbox
+          WHERE subj.subject IS NOT NULL
+            AND summ.summary IS NOT NULL   -- skip empty bodies (no text to enrich)
+          ORDER BY m.date_received DESC
+          LIMIT 500
+
+      steps:
+        # -----------------------------------------------------------------
+        # STEP 1  —  reshape the flat SQL row into a JVS-compatible tree
+        #            that matches the `email` type inherited from
+        #            sysobject.
+        # -----------------------------------------------------------------
+        # The trick: sysobject declares `title` and `body` as core_mls
+        # (multi-language strings). Every mls value is an ARRAY of
+        # {lang, text} pairs — that shape is what enrichment expects
+        # to iterate over.
+        #
+        # If we set `out.title = "hello"` (bare string), jvs-enrich has
+        # nowhere to write `.clean` / `.segmented` / `.segmented_ner`
+        # back to. We MUST put the text under `title.mls[N].text` where
+        # each element gets its own enrichment output stapled onto it.
+        - kind: groovy-map
+          script: |
+            // Start with a fresh empty map — the row that comes back
+            // becomes the input to the next step.
+            def out = [:]
+
+            // ht_type = the JVS type name this row conforms to. The
+            // downstream jvs-lucene sink reads this to pick the
+            // projection strategy (per-field analyzer selection).
+            //
+            // CHANGE THIS if you rename email.json to something else.
+            out.ht_type = 'email'
+
+            // JVS id — every JVS object needs a stable String id.
+            // Using the Envelope Index rowid gives deterministic
+            // exactly-once semantics: retried mappers land the same
+            // Lucene doc for the same message (via addIdempotent /
+            // updateDocument by _taskseq).
+            out.id = String.valueOf(row.id)
+
+            // ---- title ← subject ----
+            // Wrap the subject string as one core_mls entry, tagged
+            // 'en'. If you know some subjects are non-English, add
+            // language detection here and set lang accordingly — the
+            // jvs-enrich engine picks the right OpenNLP model per lang.
+            out.title = [
+                mls: [ [ lang: 'en', text: row.subject ?: '' ] ]
+            ]
+
+            // ---- body ← summary preview ----
+            // Same shape. The `summaries` table stores a preview snippet
+            // (up to a few hundred chars) — enough for reasonable NER
+            // signal on personal names, orgs, dates without needing to
+            // read the raw .emlx message files.
+            //
+            // CHANGE THIS: if you want the FULL body text, replace with
+            // a groovy-map step that reads the .emlx file at
+            //   ~/Library/Mail/V10/<accountid>/<mailbox>/Messages/<id>.emlx
+            // and pastes it in here. Costs a lot of I/O — batch prefer.
+            if (row.body != null && !row.body.toString().isEmpty()) {
+                out.body = [
+                    mls: [ [ lang: 'en', text: row.body ] ]
+                ]
+            }
+
+            // ---- times.date_received ----
+            // sysobject declares `times: core_dates`. Setting
+            // times.date_received here matches the shape of the
+            // canonical date map (add more keys — date_sent,
+            // date_last_viewed — as needed).
+            if (row.received_ts != null) {
+                out.times = [ date_received: (long)(row.received_ts * 1000L) ]
+            }
+
+            // ---- email-specific fields ----
+            // Declared in email.json's fields[]. Any field NOT in the
+            // type definition will still be indexed as _source (when
+            // storeSource: true) but won't get a typed Lucene analyzer.
+            //
+            // Extract sender domain via a simple substring split. See
+            // mail-register.yaml for a "folded domain" heuristic that
+            // collapses mailchimp per-campaign subdomains.
+            def raw = null
+            if (row.sender_address != null) {
+                def at = row.sender_address.indexOf('@')
+                if (at > 0) raw = row.sender_address.substring(at + 1).toLowerCase()
+            }
+            out.sender_address  = row.sender_address
+            out.sender_name     = row.sender_name
+            out.sender_domain   = raw
+            out.recipient_count = row.recipient_count
+            out.mailbox_url     = row.mailbox_url
+
+            // Convert SQLite integers (0/1) to real booleans — the JVS
+            // type says core_boolean so the sink expects true/false.
+            out.read            = row.read == 1
+            out.flagged         = row.flagged == 1
+            out.size_bytes      = row.size_bytes
+
+            // Newsletter heuristic — same list-host detection as
+            // mail-register.yaml. Add more list hosts to LIST as
+            // relevant to your inbox.
+            def LIST = ['mailchimpapp.com','substack.com','mailerlite.com',
+                        'tinyletter.com','buttondown.email','convertkit.com']
+            out.is_newsletter = raw != null && LIST.any { raw.endsWith('.' + it) || raw == it }
+
+            out
+
+        # -----------------------------------------------------------------
+        # STEP 2  —  JVS enrichment (segmentation + POS + NER).
+        # -----------------------------------------------------------------
+        # Walks the JVS tree looking for core_mls fields (title, body),
+        # runs OpenNLP over each entry's `.text`, and appends:
+        #   .clean          — text with mail-preview noise stripped
+        #   .segmented      — list of sentences
+        #   .pos            — list of {token: POS-tag} maps per sentence
+        #   .segmented_ner  — sentences with <person>/<organization>/
+        #                     <location>/<date> bracket-annotations
+        #
+        # The output is still a JVS `email` document; downstream steps
+        # + sinks see the enriched fields as if they'd always been there.
+        - kind: jvs-enrich
+          # `tags` selects which enrichment groups run (must match tags
+          # declared on your type's fields — email.json inherits from
+          # sysobject which has the standard basic/segmented/pos/ner
+          # groups on title + body).
+          #
+          # CHANGE THIS to reduce work: drop `ner` if you only need
+          # sentence segmentation; drop `pos` if you don't need
+          # part-of-speech tagging.
+          tags: [basic, segmented, pos, ner]
+
+          # Points at our email type definition. classpath: works
+          # because the file lives at
+          #   src/main/resources/types/email.json
+          # in the sqlite adapter jar (so it's on the driver classpath
+          # once the module is installed).
+          #
+          # CHANGE THIS to file:/absolute/path/email.json if you want
+          # to iterate without rebuilding the jar.
+          typeJsonResource: "classpath:/types/email.json"
+
+      # ---------------------------------------------------------------------
+      # SINK  —  type-aware Lucene index.
+      # ---------------------------------------------------------------------
+      # jvs-lucene reads the JVS type and projects each field per its
+      # groups[].method. sender_domain → StringField (exact match),
+      # title/body mls → per-language TextField with the right stemmer,
+      # NER tokens → StringFields on segmented_ner.textmarkup_en_m so
+      # you can filter by entity type + surface form.
+      sinks:
+        - kind: jvs-lucene
+          # The index directory name. Lives at
+          # ~/.hitorro/pipelines/lucene/<name>/.
+          # Search endpoint becomes GET /mesh/search/<name>?q=...
+          name: mail-jvs-enriched
+
+          # Same type as the enrich step above — the sink needs it to
+          # decide which analyzer to attach to which field.
+          typeJsonResource: "classpath:/types/email.json"
+
+          # storeSource: true (the default when omitted) means the
+          # full enriched JVS lands in a stored _source field, so
+          # search hits carry the entire enrichment payload (clean,
+          # segmented, pos, segmented_ner). Set false for smaller
+          # index if you only need term-search + hit doc IDs.
+
+# =========================================================================
+#  AFTER RUNNING
+# =========================================================================
+#
+#  # verify the index exists + doc count
+#  curl -s http://localhost:8085/mesh/search | jq '.[] | select(.name=="mail-jvs-enriched")'
+#
+#  # full-text over the body's cleaned + stemmed english text
+#  curl -s 'http://localhost:8085/mesh/search/mail-jvs-enriched?q=body.mls.clean.text_en_m:kubernetes'
+#
+#  # every message where NER extracted at least one PERSON entity
+#  curl -s 'http://localhost:8085/mesh/search/mail-jvs-enriched?q=body.mls.segmented_ner.textmarkup_en_m:NE_Person'
+#
+#  # by sender_domain (exact — StringField)
+#  curl -s 'http://localhost:8085/mesh/search/mail-jvs-enriched?q=sender_domain.identifier_s:substack.com'
+#
+#  # combine
+#  curl -s 'http://localhost:8085/mesh/search/mail-jvs-enriched?q=%2Bis_newsletter.identifier_s:false+%2Btitle.mls.clean.text_en_m:meeting'

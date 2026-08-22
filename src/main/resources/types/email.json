@@ -1,0 +1,52 @@
+{
+  "name": "email",
+  "description": "JVS type for an email message. Extends sysobject so the inherited title (core_mls) + body (core_mls) fields carry the subject and body preview respectively — every mls entry then gets the full enrichment surface (clean, segmented, pos, segmented_ner) when the jvs-enrich step runs.\n\nAdds email-specific top-level fields on top of what sysobject provides:\n  · sender_address / sender_name / sender_domain — the RFC 822 sender\n  · recipient_count                                — number of To/Cc/Bcc addresses (denormalised from the Envelope Index)\n  · mailbox_url                                    — imap://... / mbox: / etc.\n  · read / flagged                                 — user state\n  · size_bytes                                     — full message size on disk\n  · is_newsletter                                  — list-shaped heuristic (see mail-register.yaml Groovy step)\n\nTo add another field: append to `fields[]` below. Choose a core type (core_string / core_long / core_boolean / core_url / core_mls / core_date) and — if you want the field to be searchable — declare it under groups: with the appropriate method:\n  · identifier — exact-match StringField (best for domains, email addresses, IDs)\n  · text       — analyzed TextField (best for free-text values that should tokenise)\n  · long       — LongPoint + numeric doc values (best for range queries + sort)\n  · date       — date-parsed (looks up parser via typesystem)\n\nDon't put subject or body preview here as scalar fields — they come from the inherited sysobject.title / sysobject.body (both core_mls, so the enrichment pipeline populates .clean / .segmented / .pos / .segmented_ner on each mls entry).",
+  "super": "sysobject",
+  "fields": [
+    {
+      "name": "sender_address",
+      "type": "core_string",
+      "groups": [ { "name": "index", "method": "identifier" } ]
+    },
+    {
+      "name": "sender_name",
+      "type": "core_string",
+      "groups": [ { "name": "index", "method": "text" } ]
+    },
+    {
+      "name": "sender_domain",
+      "type": "core_string",
+      "groups": [ { "name": "index", "method": "identifier" } ]
+    },
+    {
+      "name": "recipient_count",
+      "type": "core_long",
+      "groups": [ { "name": "index", "method": "long" } ]
+    },
+    {
+      "name": "mailbox_url",
+      "type": "core_string",
+      "groups": [ { "name": "index", "method": "identifier" } ]
+    },
+    {
+      "name": "read",
+      "type": "core_boolean",
+      "groups": [ { "name": "index", "method": "identifier" } ]
+    },
+    {
+      "name": "flagged",
+      "type": "core_boolean",
+      "groups": [ { "name": "index", "method": "identifier" } ]
+    },
+    {
+      "name": "size_bytes",
+      "type": "core_long",
+      "groups": [ { "name": "index", "method": "long" } ]
+    },
+    {
+      "name": "is_newsletter",
+      "type": "core_boolean",
+      "groups": [ { "name": "index", "method": "identifier" } ]
+    }
+  ]
+}
