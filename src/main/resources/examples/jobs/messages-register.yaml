@@ -1,0 +1,66 @@
+# iMessage / SMS — materialise chat.db into a queryable mesh table.
+#
+# After running:
+#   SELECT contact, COUNT(*) FROM messages_texts GROUP BY contact ORDER BY 2 DESC LIMIT 20
+#
+# Requires: Full Disk Access on the driver JVM. Driver-local only.
+#
+# Timestamp note: iMessage dates are Cocoa-epoch NANOSECONDS since
+# 2001-01-01 UTC. Conversion:
+#     unix_secs = (date / 1000000000) + 978307200
+# Older macOS (High Sierra and earlier) used seconds directly — if
+# received_iso comes back as pre-1970 dates, replace the division
+# with `+ 978307200` alone in the query below.
+job: messages-register
+nodes:
+  - id: extract
+    pipeline:
+      source:
+        kind: sqlite
+        path: "~/Library/Messages/chat.db"
+        query: |
+          SELECT
+            m.ROWID          AS id,
+            m.date           AS date_ns,
+            m.text           AS text,
+            m.is_from_me     AS from_me,
+            m.is_read        AS read,
+            m.service        AS service,        -- iMessage / SMS
+            h.id             AS contact,        -- phone number or email
+            h.country        AS contact_country,
+            c.chat_identifier AS chat_id,
+            c.display_name   AS chat_name,
+            c.style          AS chat_style      -- 43=1:1, 45=group
+          FROM message m
+          LEFT JOIN handle             h  ON h.ROWID = m.handle_id
+          LEFT JOIN chat_message_join  cmj ON cmj.message_id = m.ROWID
+          LEFT JOIN chat               c   ON c.ROWID  = cmj.chat_id
+          WHERE m.text IS NOT NULL
+      steps:
+        - kind: groovy-map
+          script: |
+            // Cocoa nanoseconds → ISO / year_month / hour.
+            if (row.date_ns != null) {
+                def ms = (long)(row.date_ns / 1_000_000L + 978_307_200_000L)
+                def d = new java.util.Date(ms)
+                row.sent_iso    = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'").tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d)
+                row.year_month  = new java.text.SimpleDateFormat('yyyy-MM').tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d)
+                row.day_of_week = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.day]
+                row.hour_of_day = new java.text.SimpleDateFormat('HH').tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d) as Integer
+            }
+            row.text_length = (row.text ?: '').length()
+            row.is_group    = row.chat_style == 45
+            row
+      sinks:
+        - kind: ndjson-file
+          url: "/tmp/hitorro-mesh-smoke/datasets/messages_texts/data.ndjson"
+          registerAsTable:
+            tableName: messages_texts
+            partitionKey: contact
+            broadcast: true

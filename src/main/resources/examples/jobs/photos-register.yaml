@@ -1,0 +1,84 @@
+# Apple Photos library — materialise ZASSET into a queryable table.
+#
+# One row per asset (photo or video). Includes date taken, file name,
+# type identifier, dimensions, duration (videos), GPS coords, favorite
+# flag, trash state.
+#
+# After running:
+#   SELECT year_month, COUNT(*) FROM photos_assets GROUP BY year_month ORDER BY year_month DESC
+#
+# Timestamp: ZDATECREATED / ZADDEDDATE are Cocoa-epoch seconds (REAL).
+# Driver-local only.
+job: photos-register
+nodes:
+  - id: extract
+    pipeline:
+      source:
+        kind: sqlite
+        # NOTE: change "Photos Library.photoslibrary" to match your
+        # actual library name if you renamed it. This is the default.
+        path: "~/Pictures/Photos Library.photoslibrary/database/Photos.sqlite"
+        query: |
+          SELECT
+            Z_PK              AS id,
+            ZDATECREATED      AS taken_ts_cocoa,
+            ZADDEDDATE        AS added_ts_cocoa,
+            ZFILENAME         AS filename,
+            ZUNIFORMTYPEIDENTIFIER AS uti,
+            ZKIND             AS kind,            -- 0=photo, 1=video
+            ZWIDTH            AS width,
+            ZHEIGHT           AS height,
+            ZDURATION         AS duration,        -- seconds (video)
+            ZLATITUDE         AS lat,
+            ZLONGITUDE        AS lng,
+            ZFAVORITE         AS favorite,
+            ZTRASHEDSTATE     AS trashed,
+            ZHDRTYPE          AS hdr,
+            ZDEPTHTYPE        AS depth            -- 1=portrait mode
+          FROM ZASSET
+      steps:
+        - kind: groovy-map
+          script: |
+            // Cocoa seconds → ISO / year_month / hour.
+            if (row.taken_ts_cocoa != null) {
+                def ms = (long)((row.taken_ts_cocoa + 978_307_200) * 1000d)
+                def d = new java.util.Date(ms)
+                row.taken_iso   = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'").tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d)
+                row.year_month  = new java.text.SimpleDateFormat('yyyy-MM').tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d)
+                // Named year_num because bare "year" is a reserved word
+                // in the mesh SQL engine (function name conflict).
+                row.year_num    = new java.text.SimpleDateFormat('yyyy').tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d) as Integer
+                row.day_of_week = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.day]
+                row.hour_of_day = new java.text.SimpleDateFormat('HH').tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d) as Integer
+            }
+            // Human-friendly kind + megapixel derivation.
+            row.kind_name = (row.kind == 1) ? 'video' : 'photo'
+            if (row.width != null && row.width > 0 && row.height != null && row.height > 0) {
+                row.megapixels = ((row.width * row.height) / 1_000_000.0d).round(2)
+                row.aspect_ratio = ((double) row.width / row.height).round(2)
+                row.orientation =
+                    row.width > row.height * 1.05 ? 'landscape' :
+                    row.height > row.width * 1.05 ? 'portrait' : 'square'
+            }
+            row.has_location = row.lat != null && row.lng != null
+                            && !(row.lat == 0 && row.lng == 0)
+            row.is_portrait_mode = row.depth == 1
+            row.is_hdr = row.hdr != null && row.hdr > 0
+            row.is_favorite = row.favorite == 1
+            row.is_trashed  = row.trashed  == 1
+            row
+      sinks:
+        - kind: ndjson-file
+          url: "/tmp/hitorro-mesh-smoke/datasets/photos_assets/data.ndjson"
+          registerAsTable:
+            tableName: photos_assets
+            partitionKey: year_month
+            broadcast: true

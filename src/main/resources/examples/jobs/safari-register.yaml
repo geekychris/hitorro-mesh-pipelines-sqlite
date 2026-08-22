@@ -1,0 +1,68 @@
+# Safari browsing history — materialise History.db into a queryable
+# mesh table. One row per VISIT (not per URL), joined with the URL /
+# domain metadata.
+#
+# After running:
+#   SELECT domain, COUNT(*) FROM safari_visits GROUP BY domain ORDER BY 2 DESC LIMIT 20
+#
+# Timestamp: visit_time is Cocoa-epoch SECONDS (REAL). Conversion:
+#     unix_secs = visit_time + 978307200
+#
+# Driver-local only.
+job: safari-register
+nodes:
+  - id: extract
+    pipeline:
+      source:
+        kind: sqlite
+        path: "~/Library/Safari/History.db"
+        query: |
+          SELECT
+            v.id           AS visit_id,
+            v.visit_time   AS visit_ts_cocoa,
+            v.title        AS title,
+            v.load_successful AS ok,
+            hi.url         AS url,
+            hi.domain_expansion AS domain_raw,
+            hi.visit_count AS lifetime_visits
+          FROM history_visits v
+          JOIN history_items hi ON hi.id = v.history_item
+      steps:
+        - kind: groovy-map
+          script: |
+            // Cocoa seconds → ISO / year_month / hour.
+            if (row.visit_ts_cocoa != null) {
+                def ms = (long)((row.visit_ts_cocoa + 978_307_200) * 1000d)
+                def d = new java.util.Date(ms)
+                row.visited_iso = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'").tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d)
+                row.year_month  = new java.text.SimpleDateFormat('yyyy-MM').tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d)
+                row.day_of_week = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.day]
+                row.hour_of_day = new java.text.SimpleDateFormat('HH').tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d) as Integer
+            }
+            // Extract clean domain from URL. Prefer domain_expansion if
+            // Safari populated it (it's the "friendly" form); fall
+            // through to URL parsing.
+            def domain = row.domain_raw
+            if ((domain == null || domain.isEmpty()) && row.url != null) {
+                def m = row.url =~ ~/^https?:\/\/([^\/:?#]+)/
+                if (m.find()) domain = m.group(1).toLowerCase()
+            }
+            row.domain = domain
+            // "Interesting" heuristic — filter out Google search redirect
+            // noise, tracker pixels, etc. later via SQL WHERE.
+            row.is_search_result = row.url != null && (
+                row.url.contains('/search?') || row.url.contains('google.com/url'))
+            row
+      sinks:
+        - kind: ndjson-file
+          url: "/tmp/hitorro-mesh-smoke/datasets/safari_visits/data.ndjson"
+          registerAsTable:
+            tableName: safari_visits
+            partitionKey: domain
+            broadcast: true

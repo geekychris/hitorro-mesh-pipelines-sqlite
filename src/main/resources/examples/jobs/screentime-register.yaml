@@ -1,0 +1,78 @@
+# macOS Screen Time / Knowledge — materialise app-usage events into a
+# queryable mesh table.
+#
+# The knowledgeC.db "ZOBJECT" table is the master event ledger. Rows
+# with ZSTREAMNAME='/app/usage' are per-session app foreground events.
+# Other streams (/app/inFocus, /device/battery, /notification/publisher,
+# ...) can be queried by adjusting the WHERE.
+#
+# After running:
+#   SELECT app_bundle, ROUND(SUM(duration_sec)/3600.0, 2) AS hours
+#   FROM screentime_events GROUP BY app_bundle ORDER BY hours DESC LIMIT 20
+#
+# Timestamp: ZSTARTDATE / ZENDDATE are Cocoa-epoch seconds (REAL).
+# Driver-local only.
+job: screentime-register
+nodes:
+  - id: extract
+    pipeline:
+      source:
+        kind: sqlite
+        path: "~/Library/Application Support/Knowledge/knowledgeC.db"
+        query: |
+          SELECT
+            Z_PK        AS id,
+            ZSTARTDATE  AS start_ts_cocoa,
+            ZENDDATE    AS end_ts_cocoa,
+            ZVALUESTRING AS app_bundle,
+            ZSTREAMNAME AS stream,
+            ZSOURCE     AS source_id
+          FROM ZOBJECT
+          WHERE ZSTREAMNAME = '/app/usage'
+            AND ZVALUESTRING IS NOT NULL
+      steps:
+        - kind: groovy-map
+          script: |
+            // Cocoa seconds → ISO / year_month / hour.
+            if (row.start_ts_cocoa != null) {
+                def ms = (long)((row.start_ts_cocoa + 978_307_200) * 1000d)
+                def d = new java.util.Date(ms)
+                row.started_iso = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'").tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d)
+                row.year_month  = new java.text.SimpleDateFormat('yyyy-MM').tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d)
+                row.day_of_week = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.day]
+                row.hour_of_day = new java.text.SimpleDateFormat('HH').tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d) as Integer
+            }
+            // Session duration in seconds. Guard against negative or
+            // missing end timestamps (some events are point-in-time).
+            if (row.start_ts_cocoa != null && row.end_ts_cocoa != null) {
+                double dsec = row.end_ts_cocoa - row.start_ts_cocoa
+                row.duration_sec = dsec > 0 ? dsec.round(1) : 0.0d
+            } else {
+                row.duration_sec = 0.0d
+            }
+            // App category heuristic — very rough, based on bundle-id prefix.
+            def b = row.app_bundle ?: ''
+            row.app_category =
+                b.startsWith('com.apple.') ? 'Apple' :
+                b.contains('.slack')       ? 'Slack' :
+                b.contains('.zoom')        ? 'Meetings' :
+                b.contains('.chrome')      ? 'Chrome' :
+                b.contains('.firefox')     ? 'Firefox' :
+                b.contains('safari')       ? 'Safari' :
+                b.contains('.jetbrains.')  ? 'JetBrains' :
+                b.contains('.microsoft.')  ? 'Microsoft' :
+                b.contains('.spotify')     ? 'Spotify' : 'Other'
+            row
+      sinks:
+        - kind: ndjson-file
+          url: "/tmp/hitorro-mesh-smoke/datasets/screentime_events/data.ndjson"
+          registerAsTable:
+            tableName: screentime_events
+            partitionKey: app_bundle
+            broadcast: true

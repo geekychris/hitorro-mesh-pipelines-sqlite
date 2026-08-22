@@ -212,6 +212,20 @@ public final class SqliteSourceAdapter implements SourceAdapter {
                         else           row.put(colNames[i], Base64.getEncoder().encodeToString(v));
                     }
                     case Types.NULL -> row.putNull(colNames[i]);
+                    case Types.TIMESTAMP, Types.TIMESTAMP_WITH_TIMEZONE,
+                         Types.DATE, Types.TIME, Types.TIME_WITH_TIMEZONE -> {
+                        // SQLite has no native date type — apps store
+                        // dates as REAL (Cocoa/unix epoch) or INTEGER
+                        // (unix seconds) with a TIMESTAMP column-type
+                        // hint. The JDBC driver reports these as
+                        // Types.TIMESTAMP but the underlying storage
+                        // stays numeric. Read as double so downstream
+                        // math (row.date + 978307200) does arithmetic,
+                        // not string concatenation.
+                        double v = rs.getDouble(idx);
+                        if (rs.wasNull()) row.putNull(colNames[i]);
+                        else              row.put(colNames[i], v);
+                    }
                     default -> {
                         String v = rs.getString(idx);
                         if (v == null) row.putNull(colNames[i]);
