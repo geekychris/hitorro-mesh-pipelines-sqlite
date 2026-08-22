@@ -1,0 +1,26 @@
+# Index Mac Mail into Lucene for full-text search over subject +
+# sender. Once run, GET /mesh/lucene/mail-idx/search?q=kubernetes
+# returns matching messages.
+#
+# Requires: hitorro-mesh-pipelines-sqlite AND hitorro-mesh-pipelines-lucene
+# on the classpath. Full Disk Access as per mail-top-domains.yaml.
+#
+# Driver-local only (sqlite source constraint).
+job: mail-index
+nodes:
+  - id: fetch
+    pipeline:
+      source:
+        kind: sqlite
+        path: "~/Library/Mail/V10/MailData/Envelope Index"
+        # ROWID as id so retries via addIdempotent stay stable across
+        # runs — see the Lucene sink's exactly-once semantics.
+        query: |
+          SELECT m.ROWID AS id,
+                 s.address AS sender,
+                 m.subject_prefix || m.subject AS subject,
+                 datetime(m.date_received, 'unixepoch') AS received
+          FROM messages m
+          LEFT JOIN addresses s ON s.ROWID = m.sender
+      sinks:
+        - {kind: lucene, name: mail-idx}   # storeSource defaults to true — search hits carry real content

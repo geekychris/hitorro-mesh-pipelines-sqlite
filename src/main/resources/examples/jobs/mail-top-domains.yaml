@@ -1,0 +1,41 @@
+# Top email domains you correspond with (Mac Mail).
+#
+# Requires:
+#   - hitorro-mesh-pipelines-sqlite on the driver classpath
+#   - Full Disk Access granted to the JVM running the driver (System
+#     Settings → Privacy & Security → Full Disk Access → add the java
+#     binary or the launching Terminal/IDE)
+#   - The Mail Envelope Index at the path below (adjust the V number
+#     to match your macOS version — V10 is Sonoma+; older versions
+#     might be V9, V8, ...)
+#
+# Run driver-local via POST /mesh/jobs/run.
+# /mesh/jobs/run-distributed will reject this spec because sqlite
+# sources can't be dispatched to remote agents.
+job: mail-top-domains
+nodes:
+  - id: scan
+    pipeline:
+      source:
+        kind: sqlite
+        path: "~/Library/Mail/V10/MailData/Envelope Index"
+        # Adjust the WHERE clause to focus on recent mail, a specific
+        # mailbox, etc. Schema varies subtly across macOS versions;
+        # `sqlite3 <path> .schema messages` from the shell reveals it.
+        query: |
+          SELECT s.address AS sender
+          FROM messages m
+          JOIN addresses s ON s.ROWID = m.sender
+          WHERE s.address IS NOT NULL
+      steps:
+        - {kind: groovy-map, script: |
+            def at = row.sender?.indexOf('@')
+            if (at != null && at > 0) row.domain = row.sender.substring(at + 1).toLowerCase()
+            row}
+        - {kind: filter, expr: "domain != null"}
+      reduce:
+        group-by: [domain]
+        aggs:
+          - {name: n, kind: COUNT}
+      sinks:
+        - {kind: ndjson-file, url: "target/mail-top-domains.ndjson"}
