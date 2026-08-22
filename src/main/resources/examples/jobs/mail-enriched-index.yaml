@@ -1,0 +1,112 @@
+# Enrich Mac Mail into a searchable Lucene index with NLP-populated
+# entity fields — persons, organizations, locations extracted from
+# subject + summary. After running, GET /mesh/lucene/mail-enriched/search?q=...
+# returns hits with entity-facet-enabled search.
+#
+# Pipeline:
+#   sqlite (join messages+addresses+subjects+summaries)
+#     → groovy-map (shape rows into JVS-compatible form: id + core_mls
+#                   title from subject, core_mls body from summary,
+#                   times.date_received)
+#     → jvs-enrich (segmentation + POS + NER over title.mls[].text
+#                   + body.mls[].text — populates title.mls[].clean,
+#                   .segmented, .pos, .segmented_ner from the type's
+#                   groups[].method chain in mail_message.json)
+#     → jvs-lucene (type-aware Lucene projection — every field lands
+#                   with the right analyzer chain; sender_domain gets
+#                   identifier / exact match, subject gets full-text
+#                   + language stemming + NER faceting)
+#
+# Warning: enrichment via OpenNLP is CPU-intensive. Full 344k message
+# scan takes many minutes. Start with the LIMIT'd query below for a
+# quick smoke test; remove LIMIT for the full run.
+#
+# Requires:
+#   - hitorro-mesh-pipelines-sqlite AND hitorro-mesh-pipelines-jvstype
+#     on the driver classpath
+#   - OpenNLP models under $HT_BIN/data/opennlpmodels1.5/en-*.bin
+#     (install with scripts/install-nlp-models.sh in hitorro-jsontypesystem)
+#   - Full Disk Access on the JVM
+#
+# Driver-local only (sqlite constraint).
+job: mail-enriched-index
+nodes:
+  - id: enrich
+    pipeline:
+      source:
+        kind: sqlite
+        path: "~/Library/Mail/V10/MailData/Envelope Index"
+        # Recent 500 messages — enough to see the enrichment work
+        # without waiting 10+ minutes. Remove LIMIT to index everything.
+        query: |
+          SELECT
+            m.ROWID          AS id,
+            m.date_received  AS received_ts,
+            addr.address     AS sender_address,
+            addr.comment     AS sender_name,
+            m.subject_prefix AS subject_prefix,
+            subj.subject     AS subject,
+            summ.summary     AS summary,
+            mb.url           AS mailbox_url,
+            m.read           AS read,
+            m.flagged        AS flagged,
+            m.size           AS size
+          FROM messages m
+          LEFT JOIN addresses addr ON addr.ROWID = m.sender
+          LEFT JOIN subjects  subj ON subj.ROWID = m.subject
+          LEFT JOIN summaries summ ON summ.ROWID = m.summary
+          LEFT JOIN mailboxes mb   ON mb.ROWID   = m.mailbox
+          WHERE subj.subject IS NOT NULL
+          ORDER BY m.date_received DESC
+          LIMIT 500
+      steps:
+        - kind: groovy-map
+          # Reshape the flat SQL row into a JVS-compatible tree. The
+          # jvs-enrich step below expects title.mls[] and body.mls[]
+          # arrays where each entry is a language + text pair; that
+          # matches the sysobject supertype's core_mls fields inherited
+          # by mail_message.
+          script: |
+            def out = [:]
+            out.id = String.valueOf(row.id)
+            out.ht_type = 'mail_message'
+            // Full subject (with "Re:" / "Fwd:" prefixes preserved).
+            def fullSubject = ((row.subject_prefix ?: '') + (row.subject ?: '')).trim()
+            out.title = [mls: [[lang: 'en', text: fullSubject]]]
+            // Body preview lives in summary.
+            if (row.summary != null && !row.summary.toString().isEmpty()) {
+                out.body = [mls: [[lang: 'en', text: row.summary]]]
+            }
+            // Sender domain — useful for post-index faceting.
+            def raw = null
+            if (row.sender_address != null) {
+                def at = row.sender_address.indexOf('@')
+                if (at > 0) raw = row.sender_address.substring(at + 1).toLowerCase()
+            }
+            out.sender_address = row.sender_address
+            out.sender_name    = row.sender_name
+            out.sender_domain  = raw
+            out.mailbox_url    = row.mailbox_url
+            out.read           = (row.read == 1)
+            out.flagged        = (row.flagged == 1)
+            out.size           = row.size
+            // times.date_received matches sysobject's core_dates.
+            if (row.received_ts != null) {
+                out.times = [date_received: (long)(row.received_ts * 1000L)]
+            }
+            out
+        - kind: jvs-enrich
+          # Run all enrichment groups on the type. Populates:
+          #   title.mls[].clean         — cleaned text
+          #   title.mls[].segmented     — sentence-split
+          #   title.mls[].pos           — part-of-speech tags
+          #   title.mls[].segmented_ner — NER-annotated text with entities
+          # And the same suite on body.mls[].
+          tags: [basic, segmented, pos, ner]
+          typeJsonResource: "classpath:/types/mail_message.json"
+      sinks:
+        - kind: jvs-lucene
+          name: mail-enriched
+          typeJsonResource: "classpath:/types/mail_message.json"
+          # storeSource defaults to true — hits carry the full enriched
+          # JVS payload including all extracted entities.

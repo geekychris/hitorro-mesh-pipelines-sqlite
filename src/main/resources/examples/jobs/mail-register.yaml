@@ -1,0 +1,105 @@
+# Materialise Mac Mail's Envelope Index into a queryable mesh table.
+#
+# Reads the join of messages + addresses + subjects + summaries +
+# mailboxes into a flat NDJSON file, then registers it with the mesh
+# SQL layer as table `mail_messages`. After running, you can query:
+#
+#   SELECT sender_address, COUNT(*) AS n FROM mail_messages
+#   GROUP BY sender_address ORDER BY n DESC LIMIT 20
+#
+# via POST /mesh/queries — no more per-question ad-hoc pipeline runs.
+#
+# Uses a Groovy step to derive convenience columns:
+#   - sender_domain (folds mailchimpapp.com / substack.com subdomains)
+#   - received_iso  (unix epoch → ISO-8601 string)
+#   - year_month    (YYYY-MM for grouping)
+#   - subject_full  (subject_prefix + subject, e.g. "Re: hi")
+#   - is_newsletter (heuristic: sender_domain ends in mailchimpapp,
+#                    substack, mailerlite, tinyletter, buttondown,
+#                    or subject starts with "[list-name]")
+#
+# Requires: Full Disk Access on the JVM launching the driver.
+# Driver-local only.
+job: mail-register
+nodes:
+  - id: extract
+    pipeline:
+      source:
+        kind: sqlite
+        path: "~/Library/Mail/V10/MailData/Envelope Index"
+        query: |
+          SELECT
+            m.ROWID          AS id,
+            m.date_received  AS received_ts,
+            m.date_sent      AS sent_ts,
+            addr.address     AS sender_address,
+            addr.comment     AS sender_name,
+            m.subject_prefix AS subject_prefix,
+            subj.subject     AS subject,
+            summ.summary     AS summary,
+            mb.url           AS mailbox_url,
+            m.read           AS read,
+            m.flagged        AS flagged,
+            m.size           AS size
+          FROM messages m
+          LEFT JOIN addresses addr ON addr.ROWID = m.sender
+          LEFT JOIN subjects  subj ON subj.ROWID = m.subject
+          LEFT JOIN summaries summ ON summ.ROWID = m.summary
+          LEFT JOIN mailboxes mb   ON mb.ROWID   = m.mailbox
+      steps:
+        - kind: groovy-map
+          script: |
+            // Extract email domain, then fold well-known list-shaped
+            // per-campaign subdomains down to the parent. Turns 8 sub-
+            // domains of mailchimpapp.com into a single "mailchimpapp.com"
+            // row in top-N rollups.
+            def LIST_HOSTS = [
+                'mailchimpapp.com', 'substack.com', 'mailerlite.com',
+                'tinyletter.com', 'buttondown.email', 'convertkit.com',
+                'sendgrid.net', 'sparkpostmail.com'
+            ]
+            def raw = null
+            if (row.sender_address != null) {
+                def at = row.sender_address.indexOf('@')
+                if (at > 0) raw = row.sender_address.substring(at + 1).toLowerCase()
+            }
+            row.sender_domain = raw
+            if (raw != null) {
+                def folded = LIST_HOSTS.find { raw.endsWith('.' + it) || raw == it }
+                row.sender_domain_folded = folded ?: raw
+            }
+            // Timestamp helpers.
+            if (row.received_ts != null) {
+                def ms = (long)(row.received_ts * 1000L)
+                def d = new java.util.Date(ms)
+                row.received_iso = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'").tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d)
+                row.year_month = new java.text.SimpleDateFormat('yyyy-MM').tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d)
+                row.day_of_week = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.day]
+                row.hour_of_day = new java.text.SimpleDateFormat('HH').tap {
+                    setTimeZone(java.util.TimeZone.getTimeZone('UTC'))
+                }.format(d) as Integer
+            }
+            row.subject_full = ((row.subject_prefix ?: '') + (row.subject ?: '')).trim()
+            // Rough newsletter heuristic — folded domain matches a list
+            // host OR subject starts with "[something]" bracket tag.
+            row.is_newsletter =
+                (LIST_HOSTS.contains(row.sender_domain_folded)
+                 || (row.subject_full ==~ /^\[[^\]]+\].*/))
+            row
+      sinks:
+        - kind: ndjson-file
+          # Standard datasets location. Registered table reads from
+          # this same path on every mesh SQL query.
+          # Absolute path — the register-existing endpoint doesn't
+          # expand ~/ (only the NdjsonFileSink does). Set
+          # HITORRO_DATASETS_HOME env var or edit this path to your
+          # setup. Default: /Users/<you>/.hitorro/datasets/... .
+          url: "/tmp/hitorro-mesh-smoke/datasets/mail_messages/data.ndjson"
+          registerAsTable:
+            tableName: mail_messages
+            partitionKey: sender_domain_folded
+            broadcast: true

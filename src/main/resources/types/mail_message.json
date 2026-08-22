@@ -1,0 +1,42 @@
+{
+  "name": "mail_message",
+  "description": "JVS type for an enriched Mac Mail message. Inherits sysobject (id: core_id, title/body/description: core_mls, times: core_dates) so title (subject) and body (summary) both get the full enrichment surface — clean, segmented, pos, segmented_ner — populated by the JVS enrichment engine (jvs-enrich step) when it runs. Adds mail-specific fields on top: sender_address, sender_domain, mailbox_url, read/flagged flags. Populate title.mls[0].text with the subject line and body.mls[0].text with the summary preview from the Envelope Index; enrichment then extracts persons, orgs, locations from both.",
+  "super": "sysobject",
+  "fields": [
+    {
+      "name": "sender_address",
+      "type": "core_string",
+      "groups": [ { "name": "index", "method": "identifier" } ]
+    },
+    {
+      "name": "sender_name",
+      "type": "core_string",
+      "groups": [ { "name": "index", "method": "text" } ]
+    },
+    {
+      "name": "sender_domain",
+      "type": "core_string",
+      "groups": [ { "name": "index", "method": "identifier" } ]
+    },
+    {
+      "name": "mailbox_url",
+      "type": "core_string",
+      "groups": [ { "name": "index", "method": "identifier" } ]
+    },
+    {
+      "name": "read",
+      "type": "core_boolean",
+      "groups": [ { "name": "index", "method": "identifier" } ]
+    },
+    {
+      "name": "flagged",
+      "type": "core_boolean",
+      "groups": [ { "name": "index", "method": "identifier" } ]
+    },
+    {
+      "name": "size",
+      "type": "core_long",
+      "groups": [ { "name": "index", "method": "long" } ]
+    }
+  ]
+}
