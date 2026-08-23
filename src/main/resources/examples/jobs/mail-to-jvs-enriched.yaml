@@ -177,8 +177,11 @@ nodes:
         #   .clean          — text with mail-preview noise stripped
         #   .segmented      — list of sentences
         #   .pos            — list of {token: POS-tag} maps per sentence
-        #   .segmented_ner  — sentences with <person>/<organization>/
-        #                     <location>/<date> bracket-annotations
+        #   .segmented_ner  — sentences with [{token&&NE_Person}] /
+        #                     [{token&&NE_Location}] / [{token&&NE_Organization}] /
+        #                     [{token&&NE_Date}] per-token bracket markup
+        #                     (canonical format parsed by the analyzer's
+        #                     NERMarkupTokenFilter)
         #
         # The output is still a JVS `email` document; downstream steps
         # + sinks see the enriched fields as if they'd always been there.
@@ -240,8 +243,8 @@ nodes:
 #       body.mls[0].text            → "raw body preview"
 #       body.mls[0].clean           → "raw body preview"     (cleaned)
 #       body.mls[0].segmented       → ["sentence 1", "sentence 2", ...]
-#       body.mls[0].segmented_ner   → ["<person>Alice</person> met with ...",
-#                                       "<location>Paris</location> ...", ...]
+#       body.mls[0].segmented_ner   → ["[{Alice&&NE_Person}] met with [{Bob&&NE_Person}] ...",
+#                                       "[{Paris&&NE_Location}] ...", ...]
 #       body.mls[0].pos             → [{"Alice": "NNP"}, {"met": "VBD"}, ...]
 #       title.mls[0].{text|clean|segmented|segmented_ner|pos}
 #
@@ -270,7 +273,8 @@ nodes:
 #       body.mls[0].text        → body.mls.text_en_m           (searchable)
 #       body.mls[0].clean       → body.mls.clean.text_en_m     (searchable, stemmed)
 #       body.mls[0].segmented_ner → body.mls.segmented_ner.textmarkup_en_m
-#                                                              (each <NE_Xxx> tag emitted as a term)
+#                                                              (each [{token&&NE_Xxx}] bracket emits the
+#                                                               token AND the NE_Xxx marker as terms)
 #       sender_domain           → sender_domain.identifier_s   (exact match)
 #       size_bytes              → size_bytes.long_s            (range + sort)
 #       read                    → read.identifier_s            ("true"/"false" strings)
