@@ -92,7 +92,7 @@ nodes:
             // projection strategy (per-field analyzer selection).
             //
             // CHANGE THIS if you rename email.json to something else.
-            out.ht_type = 'email'
+            out.ht_type = 'mail_email'
 
             // JVS id — every JVS object needs a stable String id.
             // Using the Envelope Index rowid gives deterministic
@@ -201,7 +201,7 @@ nodes:
           #
           # CHANGE THIS to file:/absolute/path/email.json if you want
           # to iterate without rebuilding the jar.
-          typeJsonResource: "classpath:/types/email.json"
+          typeJsonResource: "classpath:/types/mail_email.json"
 
       # ---------------------------------------------------------------------
       # SINK  —  type-aware Lucene index.
@@ -220,7 +220,7 @@ nodes:
 
           # Same type as the enrich step above — the sink needs it to
           # decide which analyzer to attach to which field.
-          typeJsonResource: "classpath:/types/email.json"
+          typeJsonResource: "classpath:/types/mail_email.json"
 
           # storeSource: true (the default when omitted) means the
           # full enriched JVS lands in a stored _source field, so
