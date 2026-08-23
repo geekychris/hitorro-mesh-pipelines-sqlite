@@ -308,22 +308,86 @@ LIMIT 20
 
 ## After the enriched index runs
 
-Once `mail-enriched-index.yaml` finishes, the `mail-enriched` Lucene
-index is searchable via the pipelines Lucene search endpoint:
+Once `mail-to-jvs-enriched.yaml` finishes, the `mail-jvs-enriched`
+Lucene index is searchable via `GET /mesh/search/mail-jvs-enriched?q=...`.
+**Field naming is where most people get stuck** — there are two
+different views of the same data:
+
+### JSON path vs. Lucene projected field name
+
+The JVS document *stored* in Lucene looks like this (JSON):
+
+```json
+{
+  "id": "12345", "ht_type": "email",
+  "sender_domain": "substack.com",
+  "size_bytes": 42311,
+  "read": true,
+  "title": { "mls": [ { "lang": "en", "text": "Weekly digest",
+                        "clean": "Weekly digest",
+                        "segmented": ["Weekly digest"],
+                        "segmented_ner": ["Weekly digest"],
+                        "pos": [{"Weekly":"NNP"}, {"digest":"NN"}] } ] },
+  "body":  { "mls": [ { "lang": "en", "text": "…", "clean": "…",
+                        "segmented": ["…"], "segmented_ner": ["…"], "pos": [...] } ] }
+}
+```
+
+- **JSON path** is how you navigate inside a returned hit:
+  `hit.body.mls[0].segmented_ner[3]` → 4th NER-annotated sentence.
+- **Lucene projected field name** is how you address the same data
+  in a `q=` query. The jvs-lucene sink flattened the tree into
+  fields named `<json path>.<method>_<lang>_<s|m>`, chosen by the
+  type's `groups[].method` (or the enrichment convention for
+  dynamic fields):
+
+| JSON path                        | Lucene field                              | Method     | Purpose                       |
+|----------------------------------|-------------------------------------------|------------|-------------------------------|
+| `title.mls[0].text`              | `title.mls.text_en_m`                     | text       | raw indexed subject           |
+| `title.mls[0].clean`             | `title.mls.clean.text_en_m`               | text       | cleaned + stemmed subject     |
+| `title.mls[0].segmented_ner`     | `title.mls.segmented_ner.textmarkup_en_m` | textmarkup | NE_Xxx tags as searchable terms |
+| `body.mls[0].clean`              | `body.mls.clean.text_en_m`                | text       | cleaned + stemmed body        |
+| `body.mls[0].segmented_ner`      | `body.mls.segmented_ner.textmarkup_en_m`  | textmarkup | body NER terms                |
+| `sender_domain`                  | `sender_domain.identifier_s`              | identifier | exact match (no analysis)     |
+| `size_bytes`                     | `size_bytes.long_s`                       | long       | range + sort                  |
+| `read` / `flagged` / `is_newsletter` | `<name>.identifier_s`                 | identifier | boolean as `"true"`/`"false"` string |
+
+Rules of thumb:
+- Suffix `_s` = single-valued, `_m` = multi-valued (array).
+- Analysed fields (`text`, `textmarkup`) include the language code.
+- Non-analysed fields (`identifier`, `long`, `date`) skip the language.
+- The `textmarkup` chain parses the `<person>…</person>` bracket
+  annotations produced by NER — the entity type (`NE_Person`,
+  `NE_Organization`, `NE_Location`, `NE_Date`, `NE_Money`) becomes
+  its own indexed term at the entity's position.
+
+### Real queries
 
 ```bash
-# Full-text — matches enriched (segmented + stemmed) title AND body.
-curl -s 'http://localhost:8085/mesh/lucene/mail-enriched/search?q=kubernetes'
+# Full-text over the body's cleaned + stemmed English text
+curl -s 'http://localhost:8085/mesh/search/mail-jvs-enriched?q=body.mls.clean.text_en_m:kubernetes'
 
-# Field-scoped queries — take advantage of the type-aware projection.
-curl -s 'http://localhost:8085/mesh/lucene/mail-enriched/search?q=sender_domain:hyperion-entertainment.com'
+# Every message where NER extracted at least one PERSON entity
+curl -s 'http://localhost:8085/mesh/search/mail-jvs-enriched?q=body.mls.segmented_ner.textmarkup_en_m:NE_Person'
 
-# NER-facet: find every message where an ORG entity was extracted
-# containing "Apple" (populated by jvs-enrich on subject + summary).
-curl -s 'http://localhost:8085/mesh/lucene/mail-enriched/search?q=title.mls.segmented_ner:*NE_Organization*Apple*'
+# Every message where NER extracted an ORGANIZATION
+curl -s 'http://localhost:8085/mesh/search/mail-jvs-enriched?q=body.mls.segmented_ner.textmarkup_en_m:NE_Organization'
 
-# Restrict by domain + keyword.
-curl -s 'http://localhost:8085/mesh/lucene/mail-enriched/search?q=sender_domain:substack.com+AND+title.mls.text:paul'
+# By sender_domain (exact match — StringField, no analysis)
+curl -s 'http://localhost:8085/mesh/search/mail-jvs-enriched?q=sender_domain.identifier_s:substack.com'
+
+# Boolean: non-newsletter meetings
+curl -s 'http://localhost:8085/mesh/search/mail-jvs-enriched?q=%2Bis_newsletter.identifier_s:false+%2Btitle.mls.clean.text_en_m:meeting'
+```
+
+Then in the returned JSON payload, navigate via **JSON path** (NOT
+the Lucene field name):
+
+```bash
+curl -s '.../search/mail-jvs-enriched?q=body.mls.segmented_ner.textmarkup_en_m:NE_Person&limit=1' \
+    | jq '.hits[0] | { sender: .sender_address,
+                       subject: .title.mls[0].text,
+                       ner_sentences: .body.mls[0].segmented_ner[0:2] }'
 ```
 
 ---
