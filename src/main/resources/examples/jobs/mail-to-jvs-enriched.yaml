@@ -94,12 +94,15 @@ nodes:
             // CHANGE THIS if you rename email.json to something else.
             out.ht_type = 'mail_email'
 
-            // JVS id — every JVS object needs a stable String id.
-            // Using the Envelope Index rowid gives deterministic
-            // exactly-once semantics: retried mappers land the same
-            // Lucene doc for the same message (via addIdempotent /
-            // updateDocument by _taskseq).
-            out.id = String.valueOf(row.id)
+            // JVS id — sysobject declares id as core_id, a composite
+            // {domain, did, id}. Setting out.id to a bare string trips
+            // "PropaccessError: object node expected id.id" during the
+            // Lucene projection walk. Wrap as an object; using rowid
+            // for did gives deterministic exactly-once semantics —
+            // retries land on the same Lucene doc via addIdempotent /
+            // updateDocument by _taskseq.
+            def sid = String.valueOf(row.id)
+            out.id = [id: sid, did: sid, domain: 'mail']
 
             // ---- title ← subject ----
             // Wrap the subject string as one core_mls entry, tagged
