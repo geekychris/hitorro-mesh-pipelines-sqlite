@@ -90,9 +90,17 @@ nodes:
             out.read           = (row.read == 1)
             out.flagged        = (row.flagged == 1)
             out.size           = row.size
-            // times.date_received matches sysobject's core_dates.
+            // Mail's date_received epoch — emit at the TOP LEVEL so the
+            // jvs-lucene sink writes it as NumericDocValuesField
+            // (mail_message declares date_received: core_date /
+            // index.method: date). This is what powers the "newest first"
+            // / "oldest first" sort in search-ui. Keep the nested
+            // times.date_received copy for downstream consumers that
+            // already read it via the sysobject.times projection.
             if (row.received_ts != null) {
-                out.times = [date_received: (long)(row.received_ts * 1000L)]
+                def receivedMs = (long)(row.received_ts * 1000L)
+                out.date_received = receivedMs
+                out.times = [date_received: receivedMs]
             }
             out
         - kind: jvs-enrich

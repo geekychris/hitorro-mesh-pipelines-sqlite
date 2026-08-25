@@ -92,6 +92,17 @@
           "method": "identifier"
         }
       ]
+    },
+    {
+      "name": "date_received",
+      "type": "core_date",
+      "groups": [
+        {
+          "name": "index",
+          "method": "date",
+          "tags": ["basic"]
+        }
+      ]
     }
   ]
 }
