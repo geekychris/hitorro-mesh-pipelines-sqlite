@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Hitorro Mesh Pipelines Sqlite logo" width="180">
+</p>
+
 # hitorro-mesh-pipelines-sqlite
 
 Read-only SQLite source for
