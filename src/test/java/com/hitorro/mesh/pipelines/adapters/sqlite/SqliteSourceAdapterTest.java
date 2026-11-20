@@ -3,7 +3,7 @@
  */
 package com.hitorro.mesh.pipelines.adapters.sqlite;
 
-import com.fasterxml.jackson.databind.JsonNode;
+import tools.jackson.databind.JsonNode;
 import com.hitorro.mesh.pipelines.model.SourceSpec;
 import com.hitorro.mesh.pipelines.sinks.SinkRegistry;
 import com.hitorro.mesh.pipelines.sources.SourceFactory;
@@ -59,9 +59,9 @@ class SqliteSourceAdapterTest {
 
         assertThat(rows).hasSize(3);
         assertThat(rows.get(0).get("id").asLong()).isEqualTo(1);
-        assertThat(rows.get(0).get("name").asText()).isEqualTo("alice");
+        assertThat(rows.get(0).get("name").asString()).isEqualTo("alice");
         assertThat(rows.get(0).get("age").asLong()).isEqualTo(30);
-        assertThat(rows.get(2).get("name").asText()).isEqualTo("carol");
+        assertThat(rows.get(2).get("name").asString()).isEqualTo("carol");
     }
 
     @Test
@@ -104,9 +104,9 @@ class SqliteSourceAdapterTest {
         JsonNode r = rows.get(0);
         assertThat(r.get("i").asLong()).isEqualTo(42);
         assertThat(r.get("r").asDouble()).isEqualTo(3.14);
-        assertThat(r.get("s").asText()).isEqualTo("hello");
+        assertThat(r.get("s").asString()).isEqualTo("hello");
         // BLOB comes out base64-encoded — decoding back gives the bytes.
-        byte[] bytes = Base64.getDecoder().decode(r.get("b").asText());
+        byte[] bytes = Base64.getDecoder().decode(r.get("b").asString());
         assertThat(bytes).containsExactly((byte)0xde, (byte)0xad, (byte)0xbe, (byte)0xef);
         assertThat(r.get("n").isNull()).isTrue();
     }
@@ -140,7 +140,7 @@ class SqliteSourceAdapterTest {
                 "SELECT name FROM t WHERE id BETWEEN ? AND ?",
                 List.of(2, 3)), new AtomicBoolean()));
         assertThat(rows).hasSize(2);
-        assertThat(rows).extracting(r -> r.get("name").asText())
+        assertThat(rows).extracting(r -> r.get("name").asString())
                 .containsExactly("bob", "carol");
     }
 
